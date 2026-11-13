@@ -15,6 +15,7 @@ const walletRoute  = require('./routes/wallet');
 const referralRoute = require('./routes/referral');
 const ordersRoute   = require('./routes/orders');
 const filesRoute    = require('./routes/files').router;
+const marketingRoute = require('./routes/marketing');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -68,6 +69,7 @@ app.use('/api/wallet',  walletRoute);
 app.use('/api/referral', referralRoute);
 app.use('/api/orders',  ordersRoute);
 app.use('/api/files',   filesRoute);
+app.use('/api/marketing', marketingRoute);
 
 /* ── Health check ── */
 app.get('/health', (_req, res) => res.json({
