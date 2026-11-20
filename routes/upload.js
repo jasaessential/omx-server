@@ -74,18 +74,34 @@ const upload = multer({
 async function requireSecret(req, res, next) {
     const idToken = req.headers['x-server-secret'];
     if (!idToken) return res.status(403).json({ error: 'Forbidden.' });
+    let uid;
     try {
-        const { uid } = await verifyIdToken(idToken);
-        const snap  = await getDb().collection('users').doc(uid).get();
-        const d     = snap.exists ? snap.data() : {};
-        const roles = d.roles || [d.role || 'user'];
-        if (!roles.includes('admin') && !roles.includes('manage_items')) {
-            return res.status(403).json({ error: 'Admin access required.' });
-        }
-        next();
+        ({ uid } = await verifyIdToken(idToken));
     } catch (_) {
-        return res.status(403).json({ error: 'Session expired. Please sign in again.' });
+        return res.status(401).json({ error: 'Session expired. Please sign in again.' });
     }
+    // Role lookup is a Firestore read. Its failures (e.g. daily quota used up) are not a
+    // sign-in problem, so they must not be reported as "Session expired".
+    let roles;
+    try {
+        const snap = await getDb().collection('users').doc(uid).get();
+        const d    = snap.exists ? snap.data() : {};
+        roles = d.roles || [d.role || 'user'];
+    } catch (err) {
+        console.error('[upload auth] role lookup failed:', err.code, err.message);
+        return res.status(503).json({ error: firestoreErrorMessage(err) });
+    }
+    if (!roles.includes('admin') && !roles.includes('manage_items')) {
+        return res.status(403).json({ error: 'Admin access required.' });
+    }
+    next();
+}
+
+function firestoreErrorMessage(err) {
+    const quota = err && (err.code === 8 || /RESOURCE_EXHAUSTED|quota/i.test(err.message || ''));
+    return quota
+        ? 'Database daily limit reached (Firebase free plan). Saving works again after the daily reset, around 1:30 PM IST.'
+        : 'Database is not responding right now. Please try again in a minute.';
 }
 
 /* ── MIME → extension map ──────────────────────── */
