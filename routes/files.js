@@ -31,6 +31,7 @@
 
 const express = require('express');
 const { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } = require('@aws-sdk/client-s3');
+const { r2RequestHandler } = require('../r2-handler');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { db } = require('../firebase');
 const { verifyUser, verifyAdmin, sendError, fail } = require('../authHelpers');
@@ -53,6 +54,7 @@ function r2() {
         region: 'auto',
         endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
         credentials: { accessKeyId: keyId, secretAccessKey: secret },
+        ...r2RequestHandler(),
     });
     return _r2;
 }
