@@ -1,9 +1,16 @@
 /* ═══════════════════════════════════════════════
    JASA V2 — server/routes/files.js
-   Customer files (xerox documents, poster photos) in the private Supabase
-   bucket "files". Browsers never get a Supabase key: this route holds the
-   service-role key and hands out short-lived signed URLs after checking who
-   is asking.
+   Customer files (xerox documents, poster photos) in the PRIVATE Cloudflare R2
+   bucket "omx-customer-files" (moved from Supabase Storage 2026-11-21).
+   Browsers never get an R2 key: this route holds it and hands out short-lived
+   presigned URLs after checking who is asking.
+
+   Stored links did not change. Orders keep the old Supabase-style link
+   (`https://<ref>.supabase.co/storage/v1/object/public/files/<path>`) and new
+   uploads get the same form, so no order data or browser code had to change.
+   The link is only an ID now; this route maps it to an R2 key:
+     current project (FILE_LINK_BASE)  …/files/<path>  → R2 key <path>
+     any older project <ref>           …/files/<path>  → R2 key legacy/<ref>/<path>
 
    POST /api/files/upload-url  { kind: 'xerox' | 'poster' | 'order', name, orderId? }
         → { uploadUrl, fileUrl }   PUT the file body to uploadUrl; store fileUrl.
@@ -15,51 +22,84 @@
    GET  /api/files/list?prefix=     (admin)  → { files: [{ name, fullPath, created_at, metadata }] }
    POST /api/files/delete  { paths } (admin) → { deleted }
 
-   Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (secret — server only)
+   Env: R2_ACCOUNT_ID, R2_FILES_ACCESS_KEY_ID, R2_FILES_SECRET_ACCESS_KEY (secret —
+        an R2 token with Object Read & Write on the files bucket),
+        R2_FILES_BUCKET (default omx-customer-files),
+        FILE_LINK_BASE (default the Supabase project the links were made with).
    ═══════════════════════════════════════════════ */
 'use strict';
 
 const express = require('express');
+const { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { db } = require('../firebase');
 const { verifyUser, verifyAdmin, sendError, fail } = require('../authHelpers');
 
 const router = express.Router();
 
-const BUCKET      = 'files';
-const VIEW_TTL_S  = 15 * 60;
-const sbUrl = () => (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
+const VIEW_TTL_S   = 15 * 60;
+const UPLOAD_TTL_S = 2 * 60 * 60;   // big PDFs on slow phones
+const LINK_BASE = () => (process.env.FILE_LINK_BASE || 'https://tujxcpohmnprbxoyiyat.supabase.co').replace(/\/+$/, '');
+const BUCKET    = () => process.env.R2_FILES_BUCKET || 'omx-customer-files';
 
-async function sb(path, init = {}) {
-    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    if (!sbUrl() || !key) throw new Error('SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY not configured');
-    const res = await fetch(`${sbUrl()}/storage/v1${path}`, {
-        ...init,
-        // New-style keys (sb_secret_…) go in `apikey` only; legacy service_role JWTs also as Bearer
-        headers: { ...(key.startsWith('sb_') ? {} : { Authorization: `Bearer ${key}` }), apikey: key,
-                   'Content-Type': 'application/json', ...(init.headers || {}) },
+let _r2;
+function r2() {
+    if (_r2) return _r2;
+    const accountId = process.env.R2_ACCOUNT_ID;
+    const keyId  = process.env.R2_FILES_ACCESS_KEY_ID;
+    const secret = process.env.R2_FILES_SECRET_ACCESS_KEY;
+    if (!accountId || !keyId || !secret) throw new Error('R2_ACCOUNT_ID / R2_FILES_ACCESS_KEY_ID / R2_FILES_SECRET_ACCESS_KEY not configured');
+    _r2 = new S3Client({
+        region: 'auto',
+        endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+        credentials: { accessKeyId: keyId, secretAccessKey: secret },
     });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(`Supabase ${res.status}: ${body.message || body.error || 'request failed'}`);
-    return body;
+    return _r2;
 }
+const filesConfigured = () => !!(process.env.R2_ACCOUNT_ID && process.env.R2_FILES_ACCESS_KEY_ID && process.env.R2_FILES_SECRET_ACCESS_KEY);
+
+const signGet = key => getSignedUrl(r2(), new GetObjectCommand({ Bucket: BUCKET(), Key: key }), { expiresIn: VIEW_TTL_S });
 
 const encPath   = p => p.split('/').map(encodeURIComponent).join('/');
 const cleanName = n => String(n || 'file').replace(/[^a-zA-Z0-9.\-_]/g, '_').slice(-120) || 'file';
 const safeId    = s => String(s || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 128);
+const badPath   = p => !p || p.split('/').some(seg => !seg || seg === '..' || seg === '.');
 
-/** Object path inside "files" for a link into the CURRENT project (SUPABASE_URL);
-    null for anything else, including links into the old project. */
+/** Object path for a link into the CURRENT project (FILE_LINK_BASE) — this is
+    also the R2 key; null for anything else, including links into old projects. */
 function pathFromUrl(url) {
     const u = String(url || '');
-    if (u.startsWith('http') && !u.startsWith(`${sbUrl()}/`)) return null;
+    if (u.startsWith('http') && !u.startsWith(`${LINK_BASE()}/`)) return null;
     const m = u.match(/\/storage\/v1\/object\/(?:public\/|sign\/|authenticated\/)?files\/([^?#]+)/);
     if (!m) return null;
-    const p = decodeURIComponent(m[1]);
-    return p.split('/').some(seg => !seg || seg === '..' || seg === '.') ? null : p;
+    let p;
+    try { p = decodeURIComponent(m[1]); } catch { return null; }
+    return badPath(p) ? null : p;
 }
 
-/** The canonical link stored on orders (not fetchable once the bucket is private). */
-const fileUrlFor = path => `${sbUrl()}/storage/v1/object/public/${BUCKET}/${encPath(path)}`;
+/* Orders placed before 2026-10-08 link to an older Supabase project (public
+   bucket). Files copied from there live in R2 under legacy/<ref>/<path>; until
+   a file is copied (or if that project is gone) its public link is returned
+   as before. */
+const LEGACY_FILE_URL = /^https:\/\/([a-z0-9]+)\.supabase\.co\/storage\/v1\/object\/public\/files\/([^\s"'<>?#]+)$/;
+function legacyKey(url) {
+    const m = String(url || '').match(LEGACY_FILE_URL);
+    if (!m) return null;
+    let p;
+    try { p = decodeURIComponent(m[2]); } catch { return null; }
+    return badPath(p) ? null : `legacy/${m[1]}/${p}`;
+}
+
+async function inR2(key) {
+    try { await r2().send(new HeadObjectCommand({ Bucket: BUCKET(), Key: key })); return true; }
+    catch { return false; }
+}
+
+/** R2 key for any stored link, or null. */
+const keyForLink = url => pathFromUrl(url) || legacyKey(url);
+
+/** The canonical link stored on orders (an ID, not fetchable by itself). */
+const fileUrlFor = path => `${LINK_BASE()}/storage/v1/object/public/files/${encPath(path)}`;
 
 async function rolesOf(uid) {
     const s = await db.collection('users').doc(uid).get();
@@ -89,11 +129,6 @@ function orderFileLinks(order) {
     ].filter(Boolean));
 }
 
-/* Orders placed before 2026-10-08 link to the old Supabase project (public
-   bucket, not ours to sign). Those links are returned as-is, after the same
-   permission check. */
-const LEGACY_FILE_URL = /^https:\/\/[a-z0-9]+\.supabase\.co\/storage\/v1\/object\/public\/files\/[^\s"'<>]+$/;
-
 router.post('/upload-url', async (req, res) => {
     const user = await verifyUser(req, res);
     if (!user) return;
@@ -110,8 +145,9 @@ router.post('/upload-url', async (req, res) => {
             path = `xerox-orders/${id}/${file}`;
         } else fail('Invalid upload type.');
 
-        const { url } = await sb(`/object/upload/sign/${BUCKET}/${encPath(path)}`, { method: 'POST', body: '{}' });
-        res.json({ uploadUrl: `${sbUrl()}/storage/v1${url}`, fileUrl: fileUrlFor(path) });
+        // Content-Type is left out of the signature: browsers send their own.
+        const uploadUrl = await getSignedUrl(r2(), new PutObjectCommand({ Bucket: BUCKET(), Key: path }), { expiresIn: UPLOAD_TTL_S });
+        res.json({ uploadUrl, fileUrl: fileUrlFor(path) });
     } catch (err) { sendError(res, err, 'files/upload-url'); }
 });
 
@@ -125,21 +161,15 @@ async function signOrderLinks(uid, orderId, urls) {
     if (!(await canReadOrder(uid, order))) fail('File not found.');
 
     const onOrder = orderFileLinks(order);
-    const out = {}, toSign = new Map();   // object path → stored link
-    for (const url of new Set(urls)) {
-        if (!onOrder.has(url)) continue;
+    const out = {};
+    await Promise.all([...new Set(urls)].map(async url => {
+        if (!onOrder.has(url)) return;
         const path = pathFromUrl(url);
-        if (path) toSign.set(path, url);
-        else if (LEGACY_FILE_URL.test(url)) out[url] = url;   // old project's public bucket
-    }
-    if (toSign.size) {
-        const signed = await sb(`/object/sign/${BUCKET}`, {
-            method: 'POST', body: JSON.stringify({ expiresIn: VIEW_TTL_S, paths: [...toSign.keys()] }),
-        });
-        for (const s of signed) {
-            if (s.signedURL && toSign.has(s.path)) out[toSign.get(s.path)] = `${sbUrl()}/storage/v1${s.signedURL}`;
-        }
-    }
+        if (path) { out[url] = await signGet(path); return; }   // presigning is local, no network call
+        const lkey = legacyKey(url);
+        if (!lkey) return;
+        out[url] = (await inR2(lkey)) ? await signGet(lkey) : url;
+    }));
     return out;
 }
 
@@ -155,17 +185,14 @@ router.post('/view-url', async (req, res) => {
         }
         // Admin storage browser — no order context
         if (!(await rolesOf(user.uid)).includes('admin')) fail('File not found.');
-        const path = pathFromUrl(`/storage/v1/object/files/${rawPath}`);
-        if (!path) fail('File not found.');
-
-        const { signedURL } = await sb(`/object/sign/${BUCKET}/${encPath(path)}`,
-            { method: 'POST', body: JSON.stringify({ expiresIn: VIEW_TTL_S }) });
-        res.json({ url: `${sbUrl()}/storage/v1${signedURL}` });
+        const path = String(rawPath).replace(/^\/+/, '');
+        if (badPath(path)) fail('File not found.');
+        res.json({ url: await signGet(path) });
     } catch (err) { sendError(res, err, 'files/view-url'); }
 });
 
 /* Every file link on an order page at once, so the page can put openable links
-   in place of the stored ones (which 404 now that the bucket is private). */
+   in place of the stored ones (which are IDs, not fetchable). */
 router.post('/view-urls', async (req, res) => {
     const user = await verifyUser(req, res);
     if (!user) return;
@@ -177,37 +204,37 @@ router.post('/view-urls', async (req, res) => {
 });
 
 /* ── Admin storage browser (admin-cloud.html) ── */
-async function listRecursive(prefix, depth = 0) {
-    if (depth > 4) return [];
-    const items = await sb(`/object/list/${BUCKET}`, {
-        method: 'POST',
-        body: JSON.stringify({ prefix, limit: 1000, offset: 0, sortBy: { column: 'name', order: 'asc' } }),
-    });
-    let out = [];
-    for (const it of items) {
-        if (it.name === '.emptyFolderPlaceholder') continue;
-        if (!it.id) out = out.concat(await listRecursive(`${prefix}${it.name}/`, depth + 1));
-        else out.push({ name: it.name, fullPath: prefix + it.name, created_at: it.created_at, metadata: { size: it.metadata?.size } });
-    }
-    return out;
-}
-
 router.get('/list', async (req, res) => {
     if (!(await verifyAdmin(req, res))) return;
     try {
-        const prefix = String(req.query.prefix || '').replace(/^\/+/, '');
-        res.json({ files: await listRecursive(prefix && !prefix.endsWith('/') ? `${prefix}/` : prefix) });
+        let prefix = String(req.query.prefix || '').replace(/^\/+/, '');
+        if (prefix && !prefix.endsWith('/')) prefix += '/';
+        const files = [];
+        let token;
+        do {
+            const page = await r2().send(new ListObjectsV2Command({ Bucket: BUCKET(), Prefix: prefix || undefined, ContinuationToken: token, MaxKeys: 1000 }));
+            for (const o of page.Contents || []) {
+                files.push({ name: o.Key.split('/').pop(), fullPath: o.Key,
+                             created_at: o.LastModified ? new Date(o.LastModified).toISOString() : null,
+                             metadata: { size: o.Size } });
+            }
+            token = page.IsTruncated ? page.NextContinuationToken : undefined;
+        } while (token && files.length < 20000);
+        files.sort((a, b) => a.fullPath.localeCompare(b.fullPath));
+        res.json({ files });
     } catch (err) { sendError(res, err, 'files/list'); }
 });
 
 router.post('/delete', async (req, res) => {
     if (!(await verifyAdmin(req, res))) return;
     try {
-        const paths = (req.body?.paths || []).map(p => pathFromUrl(`/storage/v1/object/files/${p}`)).filter(Boolean);
+        const paths = (req.body?.paths || []).map(p => String(p || '').replace(/^\/+/, '')).filter(p => !badPath(p));
         if (!paths.length || paths.length > 500) fail('Choose 1–500 files.');
-        const deleted = await sb(`/object/${BUCKET}`, { method: 'DELETE', body: JSON.stringify({ prefixes: paths }) });
-        res.json({ deleted: Array.isArray(deleted) ? deleted.length : 0 });
+        const out = await r2().send(new DeleteObjectsCommand({
+            Bucket: BUCKET(), Delete: { Objects: paths.map(Key => ({ Key })), Quiet: false },
+        }));
+        res.json({ deleted: (out.Deleted || []).length });
     } catch (err) { sendError(res, err, 'files/delete'); }
 });
 
-module.exports = { router, pathFromUrl };
+module.exports = { router, pathFromUrl, keyForLink, filesConfigured };

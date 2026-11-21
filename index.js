@@ -74,7 +74,7 @@ app.use('/api/marketing', marketingRoute);
 /* ── Health check ── */
 app.get('/health', (_req, res) => res.json({
     status: 'ok', ts: Date.now(),
-    files: !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY),   // customer uploads configured
+    files: require('./routes/files').filesConfigured(),   // customer uploads configured (R2)
 }));
 
 /* ── 404 ── */
